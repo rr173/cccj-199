@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lakescan"
+version = "0.1.0"
+description = "Snapshot-scanned reader for the offline lake table contract (Parquet + table.json), with position/equality deletes and provenance output"
+requires-python = ">=3.10"
+dependencies = ["pyarrow>=10"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["lakescan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
