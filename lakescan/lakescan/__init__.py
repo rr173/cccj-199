@@ -9,8 +9,12 @@ protocol, no generic SQL, no incremental subscription.
 
 from .errors import (
     ContractError,
+    DiffError,
     DuplicateFieldError,
+    DuplicateKeyError,
+    KeyFieldError,
     LakeScanError,
+    NullKeyError,
     PositionOutOfRangeError,
     PredicateError,
     SnapshotError,
@@ -20,14 +24,22 @@ from .errors import (
     UnknownFieldError,
     UnrepresentableKeyError,
 )
+from .diff import DiffResult, TableDiffer, compare_snapshots
 from .scan import ScanBatch, Scanner, collect
 
 __all__ = [
     "Scanner",
     "ScanBatch",
     "collect",
+    "TableDiffer",
+    "DiffResult",
+    "compare_snapshots",
     "LakeScanError",
     "ContractError",
+    "DiffError",
+    "KeyFieldError",
+    "NullKeyError",
+    "DuplicateKeyError",
     "DuplicateFieldError",
     "UnknownFieldError",
     "TypeEvolutionError",

@@ -51,3 +51,27 @@ class SourceFileMissing(LakeScanError):
 
 class PredicateError(LakeScanError):
     """A scan predicate is malformed or not exactly representable."""
+
+
+# ---------------------------------------------------------------------------
+# cross-snapshot diff
+# ---------------------------------------------------------------------------
+
+
+class DiffError(LakeScanError):
+    """Base class for errors raised by the cross-snapshot key diff."""
+
+
+class KeyFieldError(DiffError):
+    """A business-key field is missing on one side or not exactly compatible
+    with the target schema."""
+
+
+class NullKeyError(DiffError):
+    """A visible row carries a null business-key value.  The whole diff fails:
+    null can never be a business identity."""
+
+
+class DuplicateKeyError(DiffError):
+    """The same non-null business key occurs in more than one visible row of
+    one snapshot.  The whole diff fails rather than pairing rows arbitrarily."""

@@ -47,6 +47,14 @@ def cmd_build_fixtures(args) -> int:
     return 0
 
 
+def cmd_build_diff_fixtures(args) -> int:
+    from .diff_fixtures import build_diff_table
+
+    out = build_diff_table(args.out)
+    _emit({"built": str(out)})
+    return 0
+
+
 def cmd_scan(args) -> int:
     sc = Scanner(args.table, work_dir=args.work_dir,
                  batch_size=args.batch_size, prune=not args.no_prune)
@@ -89,6 +97,32 @@ def cmd_verify(args) -> int:
     return proc.returncode
 
 
+def cmd_compare(args) -> int:
+    from .diff import TableDiffer
+
+    key_field_ids = tuple(int(x) for x in args.key_fields.split(",") if x.strip())
+    differ = TableDiffer(args.table, work_dir=args.work_dir,
+                         batch_size=args.batch_size)
+    result = differ.compare(
+        source_snapshot=args.source,
+        target_snapshot=args.target,
+        target_schema_id=args.schema,
+        key_field_ids=key_field_ids,
+        output_path=args.out,
+    )
+    _emit({
+        "output": str(result.output_path),
+        "source_snapshot": result.source_snapshot,
+        "target_snapshot": result.target_snapshot,
+        "target_schema": result.target_schema_id,
+        "key_field_ids": list(result.key_field_ids),
+        "stats": result.stats.to_json(),
+        "work_dir": str(result.work_dir) if result.work_dir is not None
+        else None,
+    })
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lakescan",
@@ -100,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
     b = sub.add_parser("build-fixtures", help="build the drill table")
     b.add_argument("--out", required=True)
     b.set_defaults(fn=cmd_build_fixtures)
+
+    bd = sub.add_parser("build-diff-fixtures",
+                        help="build the cross-snapshot diff drill table")
+    bd.add_argument("--out", required=True)
+    bd.set_defaults(fn=cmd_build_diff_fixtures)
 
     s = sub.add_parser("scan", help="scan one fixed snapshot")
     s.add_argument("--table", required=True)
@@ -136,6 +175,22 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--table", required=True)
     v.add_argument("--work-dir")
     v.set_defaults(fn=cmd_verify)
+
+    c = sub.add_parser(
+        "compare",
+        help="repeatable key diff of two snapshots, atomically published",
+    )
+    c.add_argument("--table", required=True)
+    c.add_argument("--source", required=True, help="source (baseline) snapshot id")
+    c.add_argument("--target", required=True, help="target snapshot id")
+    c.add_argument("--schema", type=int, required=True,
+                   help="target schema id both sides are normalized to")
+    c.add_argument("--key-fields", required=True,
+                   help="comma-separated stable business-key field ids")
+    c.add_argument("--out", required=True, help="output JSONL path")
+    c.add_argument("--work-dir")
+    c.add_argument("--batch-size", type=int, default=8192)
+    c.set_defaults(fn=cmd_compare)
     return p
 
 
