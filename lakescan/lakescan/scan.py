@@ -104,6 +104,37 @@ class Plan:
     delete_index: DeleteIndex
     file_plans: list  # DataFilePlan
     work_dir: str
+    read_guard: Any = None
+    """Read-protection claim held for this plan's lifetime.
+
+    On a managed table every plan (including plans produced for the explain
+    interfaces) owns a guard created before the first source file is opened.
+    It is released by :meth:`close`, by using the plan/scan as a context
+    manager, or when the object is garbage collected.  ``None`` on an
+    unmanaged table.  Streaming scans that pause between batches remain
+    protected until the iterator is closed or exhausted."""
+
+    def close(self) -> None:
+        """Release the read guard (if any).  Idempotent."""
+        guard = self.read_guard
+        if guard is not None:
+            self.read_guard = None
+            close = getattr(guard, "close", None)
+            if close is not None:
+                close()
+
+    def __enter__(self) -> "Plan":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.close()
+        return False
+
+    def __del__(self):  # best effort; explicit close/context manager is the contract
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class Scanner:
@@ -114,6 +145,17 @@ class Scanner:
         self.batch_size = batch_size
         self.prune = prune
         self._contract: Optional[TableContract] = None
+        # outer read claim supplied by callers that protect several snapshots
+        # in one guard (the two-sided compare does this).
+        self._outer_guard: Any = None
+
+    def bind_read_guard(self, guard) -> None:
+        """Reuse an existing read guard instead of creating a per-plan token.
+
+        The caller retains ownership of the guard's lifecycle; plans built on
+        this scanner will not close it.  Passing ``None`` restores the default
+        behaviour of acquiring a fresh guard per plan on managed tables."""
+        self._outer_guard = guard
 
     # ------------------------------------------------------------------
     # plan
@@ -121,92 +163,124 @@ class Scanner:
 
     def plan(self, snapshot_id: str, target_schema_id: int,
              projection, predicate=None) -> Plan:
-        contract = self._contract or TableContract.load(self.root)
-        self._contract = contract
-        snapshot = contract.snapshot(snapshot_id)
-        target = contract.schema(target_schema_id)
+        # Lifecycle preflight happens BEFORE any source file is opened.  On a
+        # managed table this re-verifies the bound manifest and atomically
+        # acquires read protection; a concurrently committed retirement makes
+        # this raise SnapshotRetiredError here rather than mid-read.  Cached
+        # contracts are never trusted: every new plan re-runs the preflight,
+        # so a scanner reused after a retirement cannot read a dead snapshot.
+        from .lifecycle.reader import read_preflight
 
-        projection = tuple(projection)
-        if len(set(projection)) != len(projection):
-            raise ContractError(f"duplicate field id in projection: {projection}")
-        for fid in projection:
-            if not isinstance(fid, int) or fid not in target:
-                raise UnknownFieldError(
-                    f"projection field_id {fid!r} not in target schema "
-                    f"{target_schema_id}"
-                )
-        if isinstance(predicate, (str, dict)):
-            predicate = parse_predicate(
-                json.loads(predicate) if isinstance(predicate, str) else predicate
-            )
-        if predicate is not None and not isinstance(predicate, Pred):
-            raise PredicateError(f"bad predicate: {predicate!r}")
-        if predicate is not None:
-            validate_predicate(predicate, target)
-
-        # -- verify sources & collect data-file metadata -------------------
-        data_entries: dict[str, FileEntry] = {}
-        data_files: list[VerifiedDataFile] = []
-        delete_entries: list = []
-        for entry in snapshot.files:
-            vpath = verify_source(self.root, entry)
-            if entry.kind == KIND_DATA:
-                vf = self._open_data_file(contract, entry, vpath)
-                data_entries[entry.file_id] = entry
-                data_files.append(vf)
-            else:
-                delete_entries.append((entry, vpath))
-
-        row_counts = {vf.entry.file_id: vf.num_rows for vf in data_files}
-
-        # -- load deletes (validation errors abort here, pre-scan) ---------
-        index = DeleteIndex(self.work_dir)
-        for entry, vpath in delete_entries:
-            schema = contract.schema(entry.schema_id)
-            if entry.kind == KIND_POS_DELETE:
-                index.load_pos_deletes(entry, vpath, schema, data_entries, row_counts)
-            elif entry.kind == KIND_EQ_DELETE:
-                index.load_eq_deletes(entry, vpath, schema)
-        index.commit()
-
-        # -- eq <-> data type compatibility (exact widening only) ----------
-        for grp in index.groups.values():
-            for vf in data_files:
-                if vf.entry.partition != grp.partition:
-                    continue
-                if not any(ds > vf.entry.data_seq for _, ds in grp.delete_files):
-                    continue
-                fschema = contract.schema(vf.entry.schema_id)
-                for fid, del_type in zip(grp.field_ids, grp.field_types):
-                    f = fschema.get(fid)
-                    if f is None:
-                        continue  # missing nullable field participates as null
-                    if del_type.common_exact(f.type) is None:
-                        raise TypeEvolutionError(
-                            f"EQ key field {fid} ({del_type}) is not exactly "
-                            f"comparable with {vf.entry.file_id}'s {f.type}; "
-                            f"refusing to narrow"
-                        )
-
-        # -- per-data-file read plans --------------------------------------
-        file_plans = []
-        for vf in data_files:
-            file_plans.append(
-                self._plan_data_file(contract, vf, target, projection,
-                                     predicate, index)
-            )
-
-        return Plan(
-            contract=contract,
-            snapshot=snapshot,
-            target_schema=target,
-            projection=projection,
-            predicate=predicate,
-            data_files=data_files,
-            delete_index=index,
-            file_plans=file_plans,
-            work_dir=self.work_dir,
+        guard = read_preflight(
+            self.root, [snapshot_id], reason="scan-plan",
+            outer_guard=self._outer_guard,
         )
+        owns_guard = guard is not None and guard is not self._outer_guard
+        try:
+            contract = self._contract or TableContract.load(self.root)
+            self._contract = contract
+            # on managed tables, fail closed if retirement raced the preflight
+            from .lifecycle.state import is_managed, load_state
+
+            if is_managed(self.root):
+                state = load_state(self.root)
+                if snapshot_id in set(state.retired):
+                    from .errors import SnapshotRetiredError
+
+                    raise SnapshotRetiredError(
+                        f"snapshot {snapshot_id!r} is retired and can no longer be read"
+                    )
+            snapshot = contract.snapshot(snapshot_id)
+            target = contract.schema(target_schema_id)
+
+            projection = tuple(projection)
+            if len(set(projection)) != len(projection):
+                raise ContractError(f"duplicate field id in projection: {projection}")
+            for fid in projection:
+                if not isinstance(fid, int) or fid not in target:
+                    raise UnknownFieldError(
+                        f"projection field_id {fid!r} not in target schema "
+                        f"{target_schema_id}"
+                    )
+            if isinstance(predicate, (str, dict)):
+                predicate = parse_predicate(
+                    json.loads(predicate) if isinstance(predicate, str) else predicate
+                )
+            if predicate is not None and not isinstance(predicate, Pred):
+                raise PredicateError(f"bad predicate: {predicate!r}")
+            if predicate is not None:
+                validate_predicate(predicate, target)
+
+            # -- verify sources & collect data-file metadata -------------------
+            data_entries: dict[str, FileEntry] = {}
+            data_files: list[VerifiedDataFile] = []
+            delete_entries: list = []
+            for entry in snapshot.files:
+                vpath = verify_source(self.root, entry)
+                if entry.kind == KIND_DATA:
+                    vf = self._open_data_file(contract, entry, vpath)
+                    data_entries[entry.file_id] = entry
+                    data_files.append(vf)
+                else:
+                    delete_entries.append((entry, vpath))
+
+            row_counts = {vf.entry.file_id: vf.num_rows for vf in data_files}
+
+            # -- load deletes (validation errors abort here, pre-scan) ---------
+            index = DeleteIndex(self.work_dir)
+            for entry, vpath in delete_entries:
+                schema = contract.schema(entry.schema_id)
+                if entry.kind == KIND_POS_DELETE:
+                    index.load_pos_deletes(entry, vpath, schema, data_entries, row_counts)
+                elif entry.kind == KIND_EQ_DELETE:
+                    index.load_eq_deletes(entry, vpath, schema)
+            index.commit()
+
+            # -- eq <-> data type compatibility (exact widening only) ----------
+            for grp in index.groups.values():
+                for vf in data_files:
+                    if vf.entry.partition != grp.partition:
+                        continue
+                    if not any(ds > vf.entry.data_seq for _, ds in grp.delete_files):
+                        continue
+                    fschema = contract.schema(vf.entry.schema_id)
+                    for fid, del_type in zip(grp.field_ids, grp.field_types):
+                        f = fschema.get(fid)
+                        if f is None:
+                            continue  # missing nullable field participates as null
+                        if del_type.common_exact(f.type) is None:
+                            raise TypeEvolutionError(
+                                f"EQ key field {fid} ({del_type}) is not exactly "
+                                f"comparable with {vf.entry.file_id}'s {f.type}; "
+                                f"refusing to narrow"
+                            )
+
+            # -- per-data-file read plans --------------------------------------
+            file_plans = []
+            for vf in data_files:
+                file_plans.append(
+                    self._plan_data_file(contract, vf, target, projection,
+                                         predicate, index)
+                )
+
+            return Plan(
+                contract=contract,
+                snapshot=snapshot,
+                target_schema=target,
+                projection=projection,
+                predicate=predicate,
+                data_files=data_files,
+                delete_index=index,
+                file_plans=file_plans,
+                work_dir=self.work_dir,
+                # an outer guard is owned by the caller; only self-acquired
+                # guards are closed with this plan.
+                read_guard=guard if owns_guard else None,
+            )
+        except BaseException:
+            if owns_guard and guard is not None:
+                guard.close()
+            raise
 
     def _open_data_file(self, contract: TableContract, entry: FileEntry,
                         vpath: Path) -> VerifiedDataFile:
@@ -336,11 +410,20 @@ class Scanner:
 
     def scan(self, snapshot_id: str, target_schema_id: int, projection,
              predicate=None, _plan: Optional[Plan] = None) -> Iterator[ScanBatch]:
+        owns_plan = _plan is None
         plan = _plan or self.plan(snapshot_id, target_schema_id, projection,
                                   predicate)
         target = plan.target_schema
-        for fp in plan.file_plans:
-            yield from self._scan_file(plan, fp, target)
+        try:
+            for fp in plan.file_plans:
+                yield from self._scan_file(plan, fp, target)
+        finally:
+            # The guard spans the whole streaming lifetime -- including a
+            # reader paused between batches -- and is released on normal
+            # exhaustion, explicit generator close, or an exception.  A plan
+            # handed in by the caller follows the caller's own lifecycle.
+            if owns_plan:
+                plan.close()
 
     def _scan_file(self, plan: Plan, fp: DataFilePlan,
                    target: Schema) -> Iterator[ScanBatch]:
@@ -465,46 +548,49 @@ class Scanner:
         if target_schema_id is None:
             target_schema_id = snapshot.files[0].schema_id
         plan = self.plan(snapshot_id, target_schema_id, projection=())
-        vf = next((d for d in plan.data_files if d.entry.file_id == file_id), None)
-        if vf is None:
-            raise ContractError(
-                f"{file_id!r} is not an active DATA file of snapshot "
-                f"{snapshot_id!r}"
-            )
-        if not (0 <= position < vf.num_rows):
-            raise SnapshotError(
-                f"row_position {position} out of range for {file_id} "
-                f"({vf.num_rows} rows)"
-            )
-        reasons = []
-        for dfid in plan.delete_index.pos_delete_files_for(file_id, position):
-            reasons.append({
-                "delete_file_id": dfid,
-                "kind": KIND_POS_DELETE,
-                "detail": f"position delete on ({file_id}, {position})",
-            })
-        fp = next(p for p in plan.file_plans if p.data.entry.file_id == file_id)
-        if fp.groups:
-            fschema = contract.schema(vf.entry.schema_id)
-            row_values = self._read_row(vf, fschema, fp, position)
-            for grp in fp.groups:
-                values = [row_values.get(fid) for fid in grp.field_ids]
-                key = encode_key_tuple(grp.field_types, values)
-                for dfid in plan.delete_index.eq_delete_files_for(
-                        grp.group_id, vf.entry.data_seq, key):
-                    reasons.append({
-                        "delete_file_id": dfid,
-                        "kind": KIND_EQ_DELETE,
-                        "detail": "equality key match on field ids "
-                                  f"{list(grp.field_ids)}",
-                    })
-        return {
-            "snapshot": snapshot_id,
-            "file_id": file_id,
-            "row_position": position,
-            "deleted": bool(reasons),
-            "reasons": reasons,
-        }
+        try:
+            vf = next((d for d in plan.data_files if d.entry.file_id == file_id), None)
+            if vf is None:
+                raise ContractError(
+                    f"{file_id!r} is not an active DATA file of snapshot "
+                    f"{snapshot_id!r}"
+                )
+            if not (0 <= position < vf.num_rows):
+                raise SnapshotError(
+                    f"row_position {position} out of range for {file_id} "
+                    f"({vf.num_rows} rows)"
+                )
+            reasons = []
+            for dfid in plan.delete_index.pos_delete_files_for(file_id, position):
+                reasons.append({
+                    "delete_file_id": dfid,
+                    "kind": KIND_POS_DELETE,
+                    "detail": f"position delete on ({file_id}, {position})",
+                })
+            fp = next(p for p in plan.file_plans if p.data.entry.file_id == file_id)
+            if fp.groups:
+                fschema = contract.schema(vf.entry.schema_id)
+                row_values = self._read_row(vf, fschema, fp, position)
+                for grp in fp.groups:
+                    values = [row_values.get(fid) for fid in grp.field_ids]
+                    key = encode_key_tuple(grp.field_types, values)
+                    for dfid in plan.delete_index.eq_delete_files_for(
+                            grp.group_id, vf.entry.data_seq, key):
+                        reasons.append({
+                            "delete_file_id": dfid,
+                            "kind": KIND_EQ_DELETE,
+                            "detail": "equality key match on field ids "
+                                      f"{list(grp.field_ids)}",
+                        })
+            return {
+                "snapshot": snapshot_id,
+                "file_id": file_id,
+                "row_position": position,
+                "deleted": bool(reasons),
+                "reasons": reasons,
+            }
+        finally:
+            plan.close()
 
     def _read_row(self, vf: VerifiedDataFile, fschema: Schema,
                   fp: DataFilePlan, position: int) -> dict:
@@ -533,6 +619,13 @@ class Scanner:
     def explain_plan(self, snapshot_id: str, target_schema_id: int,
                      projection, predicate=None) -> dict:
         plan = self.plan(snapshot_id, target_schema_id, projection, predicate)
+        try:
+            return self._explain_plan_dict(plan, snapshot_id, target_schema_id)
+        finally:
+            plan.close()
+
+    def _explain_plan_dict(self, plan: Plan, snapshot_id: str,
+                           target_schema_id: int) -> dict:
         idx = plan.delete_index
         files = []
         plans_by_id = {p.data.entry.file_id: p for p in plan.file_plans}

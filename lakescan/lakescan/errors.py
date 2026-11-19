@@ -75,3 +75,73 @@ class NullKeyError(DiffError):
 class DuplicateKeyError(DiffError):
     """The same non-null business key occurs in more than one visible row of
     one snapshot.  The whole diff fails rather than pairing rows arbitrarily."""
+
+
+# ---------------------------------------------------------------------------
+# snapshot lifecycle: retention, retirement, recoverable reclamation
+# ---------------------------------------------------------------------------
+
+
+class LifecycleError(LakeScanError):
+    """Base class for errors raised by the retention/reclamation lifecycle."""
+
+
+class NotManagedError(LifecycleError):
+    """The table directory has never been onboarded into lifecycle management."""
+
+
+class AlreadyManagedError(LifecycleError):
+    """Onboarding was requested for a directory that is already managed."""
+
+
+class ManagementCorruptError(LifecycleError):
+    """The on-disk lifecycle state is missing, unparseable or internally
+    inconsistent.  A managed table in this state fails closed: every managed
+    operation raises instead of behaving like an unmanaged directory."""
+
+
+class ManifestDriftError(LifecycleError):
+    """table.json no longer matches the manifest bound at onboarding time.
+
+    Managed tables are read-only; any divergence fails closed instead of
+    silently treating the new content as the source of truth."""
+
+
+class ManagedPathError(LifecycleError):
+    """A registered path escapes the table root, uses a link component, is not
+    a regular file, or two entries claim the same canonical path with
+    conflicting digests."""
+
+
+class ReferenceConfigError(LifecycleError):
+    """A named-reference configuration is invalid (no branch, unknown or
+    retired target, bad retention depth, ...).  The whole replacement is
+    rejected; the previously committed configuration stays in force."""
+
+
+class SnapshotRetiredError(LifecycleError):
+    """A read targeted a snapshot that has been retired by a committed
+    lifecycle operation.  Retired snapshots stay visible in lineage
+    diagnostics but can never be read or referenced back into existence."""
+
+
+class PlanStaleError(LifecycleError):
+    """A plan's bindings no longer match the current management generation.
+
+    Raised when the manifest changed, the reference generation moved, the
+    retirement set moved, or re-deriving safety from the *current* state would
+    produce a different retirement/deletion set than the plan carries.  No
+    file is touched."""
+
+
+class PlanBlockedError(LifecycleError):
+    """The plan is still current but cannot be applied: a live reader protects
+    a snapshot the plan would retire, or a to-be-deleted path failed its
+    pre-commit re-verification.  Nothing is retired and no file is deleted."""
+
+
+class RecoveryInProgressError(LifecycleError):
+    """A reclamation batch is still open (pending or blocked items).  New
+    apply operations are refused until :meth:`resume` settles the batch, so
+    two operations can never process the same physical path from stale
+    state."""

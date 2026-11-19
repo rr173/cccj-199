@@ -233,13 +233,14 @@ class _SideExtractor:
 
     def __init__(self, contract: TableContract, label: str, snapshot_id: str,
                  target: Schema, key_field_ids: tuple, work_dir: str,
-                 batch_size: int):
+                 batch_size: int, outer_guard=None):
         self.contract = contract
         self.label = label
         self.snapshot_id = snapshot_id
         self.target = target
         self.key_field_ids = key_field_ids
         self.batch_size = batch_size
+        self.outer_guard = outer_guard
         db_path = os.path.join(work_dir, f"{label}_rows.sqlite")
         self.store = _SideStore(db_path)
         self.key_types = [target.field(fid).type for fid in key_field_ids]
@@ -297,6 +298,9 @@ class _SideExtractor:
             ),
             batch_size=self.batch_size,
         )
+        # the compare-level guard already covers this snapshot; reuse it
+        # instead of nesting a second token
+        scanner.bind_read_guard(self.outer_guard)
         projection = self.all_field_ids
         buf: list = []
         dup_reported: Optional[bytes] = None
@@ -539,6 +543,12 @@ class TableDiffer:
         contract.snapshot(source_snapshot)
         contract.snapshot(target_snapshot)
 
+        # One guard protects BOTH sides before either side's first file is
+        # opened, even when one side is scanned much later.  On an unmanaged
+        # table this is a no-op returning None and the legacy path is used.
+        # It is acquired inside the try block so every failure path releases it.
+        from .lifecycle.reader import read_preflight
+
         owns_work_dir = self._work_dir is None
         work_dir = Path(
             self._work_dir or tempfile.mkdtemp(prefix="lakescan-diff-")
@@ -561,15 +571,19 @@ class TableDiffer:
         os.close(tmp_fd)
         tmp_path = Path(tmp_name)
 
+        outer_guard = None
         source_run = target_run = None
         try:
+            outer_guard = read_preflight(
+                self.root, [source_snapshot, target_snapshot], reason="compare"
+            )
             source_ex = _SideExtractor(
                 contract, "source", source_snapshot, target, key_field_ids,
-                str(run_dir), self.batch_size,
+                str(run_dir), self.batch_size, outer_guard=outer_guard,
             )
             target_ex = _SideExtractor(
                 contract, "target", target_snapshot, target, key_field_ids,
-                str(run_dir), self.batch_size,
+                str(run_dir), self.batch_size, outer_guard=outer_guard,
             )
             # all pre-scan validation on both sides before any visible row is
             # read, so a rejectable input never produces a partial artifact
@@ -615,6 +629,11 @@ class TableDiffer:
                 source_run.store.close()
             if target_run is not None:
                 target_run.store.close()
+            # release the two-sided read guard on every exit path (normal,
+            # exception, KeyboardInterrupt); a killed process is handled by
+            # the stale-token sweep, never becoming permanent retention.
+            if outer_guard is not None:
+                outer_guard.close()
             # auto-created scratch space is removed on every exit; an
             # explicitly supplied work_dir is retained for inspection.
             if owns_work_dir:

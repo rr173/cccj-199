@@ -123,6 +123,79 @@ def cmd_compare(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# lifecycle: retention and recoverable reclamation
+# ---------------------------------------------------------------------------
+
+
+def _lifecycle(args):
+    from .lifecycle import LifecycleManager
+
+    return LifecycleManager(args.table)
+
+
+def cmd_onboard(args) -> int:
+    mgr = _lifecycle(args)
+    state = mgr.onboard()
+    _emit({
+        "onboarded": True,
+        "table": str(mgr.root),
+        "table_id": state.table_id,
+        "manifest_sha256": state.manifest_sha256,
+        "registered_paths": len(state.registered_paths),
+        "state_dir": str(state.dir),
+    })
+    return 0
+
+
+def cmd_lifecycle_status(args) -> int:
+    _emit(_lifecycle(args).status())
+    return 0
+
+
+def cmd_set_refs(args) -> int:
+    with open(args.config, "r", encoding="utf-8") as fh:
+        config = json.load(fh)
+    result = _lifecycle(args).set_references(config)
+    _emit(result)
+    return 0
+
+
+def cmd_make_plan(args) -> int:
+    plan = _lifecycle(args).plan()
+    if args.out:
+        plan.write(args.out)
+    _emit(plan.to_json())
+    return 0
+
+
+def cmd_apply_plan(args) -> int:
+    mgr = _lifecycle(args)
+    result = mgr.apply_plan_file(args.plan)
+    _emit(result.to_json())
+    if result.cleanup_status == "blocked":
+        # retirement happened but physical cleanup is incomplete: report
+        # distinctly so callers never mistake this for "still readable".
+        return 3
+    return 0
+
+
+def cmd_resume(args) -> int:
+    result = _lifecycle(args).resume()
+    _emit(result.to_json())
+    if result.cleanup_status == "blocked":
+        return 3
+    return 0
+
+
+def cmd_build_lifecycle_fixtures(args) -> int:
+    from .lifecycle_fixtures import build_lifecycle_table
+
+    out = build_lifecycle_table(args.out)
+    _emit({"built": str(out)})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lakescan",
@@ -191,6 +264,50 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--work-dir")
     c.add_argument("--batch-size", type=int, default=8192)
     c.set_defaults(fn=cmd_compare)
+
+    # -- lifecycle ---------------------------------------------------------
+    blf = sub.add_parser(
+        "build-lifecycle-fixtures",
+        help="build the retention/reclamation drill table (runtime, tiny files)",
+    )
+    blf.add_argument("--out", required=True)
+    blf.set_defaults(fn=cmd_build_lifecycle_fixtures)
+
+    ob = sub.add_parser(
+        "onboard",
+        help="bring an existing table directory under lifecycle management",
+    )
+    ob.add_argument("--table", required=True)
+    ob.set_defaults(fn=cmd_onboard)
+
+    st = sub.add_parser("lifecycle-status",
+                        help="show management, retention, reader and cleanup state")
+    st.add_argument("--table", required=True)
+    st.set_defaults(fn=cmd_lifecycle_status)
+
+    sr = sub.add_parser("set-refs",
+                        help="wholesale-replace the named reference configuration")
+    sr.add_argument("--table", required=True)
+    sr.add_argument("--config", required=True,
+                    help="JSON file: {branches:{name:{target,retain_generations}},"
+                         " bookmarks:{name:{target}}}")
+    sr.set_defaults(fn=cmd_set_refs)
+
+    mp = sub.add_parser("make-plan",
+                        help="derive a retention/reclamation plan (no mutation)")
+    mp.add_argument("--table", required=True)
+    mp.add_argument("--out", help="optional explicit plan JSON path")
+    mp.set_defaults(fn=cmd_make_plan)
+
+    ap = sub.add_parser("apply-plan",
+                        help="retire snapshots and reclaim paths for a saved plan")
+    ap.add_argument("--table", required=True)
+    ap.add_argument("--plan", required=True)
+    ap.set_defaults(fn=cmd_apply_plan)
+
+    rs = sub.add_parser("resume", help="continue an unfinished reclamation batch")
+    rs.add_argument("--table", required=True)
+    rs.set_defaults(fn=cmd_resume)
     return p
 
 
