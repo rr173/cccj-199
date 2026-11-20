@@ -9,6 +9,10 @@ protocol, no generic SQL, no incremental subscription.
 
 from .errors import (
     AlreadyManagedError,
+    AttributionConfigError,
+    AttributionError,
+    AttributionOutputError,
+    AttributionValidationError,
     ContractError,
     DiffError,
     DuplicateFieldError,
@@ -35,6 +39,8 @@ from .errors import (
     UnknownFieldError,
     UnrepresentableKeyError,
 )
+from .attribution import AttributionResult, FactAttributor, attribute_facts
+from .attribution_config import AttributionConfig, PayloadColumn, SideConfig
 from .diff import DiffResult, TableDiffer, compare_snapshots
 from .lifecycle import (
     ApplyResult,
@@ -59,6 +65,12 @@ __all__ = [
     "TableDiffer",
     "DiffResult",
     "compare_snapshots",
+    "FactAttributor",
+    "AttributionResult",
+    "attribute_facts",
+    "AttributionConfig",
+    "SideConfig",
+    "PayloadColumn",
     "LifecycleManager",
     "LifecycleState",
     "ApplyResult",
@@ -72,6 +84,10 @@ __all__ = [
     "load_state",
     "onboard",
     "LakeScanError",
+    "AttributionError",
+    "AttributionConfigError",
+    "AttributionValidationError",
+    "AttributionOutputError",
     "ContractError",
     "DiffError",
     "KeyFieldError",

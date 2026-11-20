@@ -145,3 +145,28 @@ class RecoveryInProgressError(LifecycleError):
     apply operations are refused until :meth:`resume` settles the batch, so
     two operations can never process the same physical path from stale
     state."""
+
+
+# ---------------------------------------------------------------------------
+# bitemporal fact attribution
+# ---------------------------------------------------------------------------
+
+
+class AttributionError(LakeScanError):
+    """Base class for errors raised by the fact attribution task."""
+
+
+class AttributionConfigError(AttributionError):
+    """The attribution mapping config is malformed (unknown table/field id,
+    bad role wiring, duplicate output column, invalid output path, ...)."""
+
+
+class AttributionValidationError(AttributionError):
+    """A visible input row violates the attribution contract (null/duplicate
+    fact id, invalid revision, duplicate rule version, bad interval, ...).
+    The whole task fails; no partial output is published."""
+
+
+class AttributionOutputError(AttributionError):
+    """The output directory already exists or another publishing error makes
+    the one-shot directory delivery impossible."""

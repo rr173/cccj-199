@@ -196,6 +196,34 @@ def cmd_build_lifecycle_fixtures(args) -> int:
     return 0
 
 
+def cmd_build_attribution_fixtures(args) -> int:
+    from .attribution_fixtures import build_attribution_fixtures
+
+    info = build_attribution_fixtures(args.out)
+    _emit({"built": str(args.out), **info})
+    return 0
+
+
+def cmd_attribute(args) -> int:
+    from .attribution import FactAttributor
+
+    result = FactAttributor(
+        args.config, work_dir=args.work_dir,
+        batch_size=args.batch_size,
+    ).attribute()
+    _emit({
+        "output_dir": str(result.output_dir),
+        "data_file": str(result.data_file),
+        "manifest_file": str(result.manifest_file),
+        "fact_rows": result.fact_rows,
+        "dimension_rows": result.dimension_rows,
+        "stats": result.stats.to_json(),
+        "work_dir": str(result.work_dir) if result.work_dir is not None
+        else None,
+    })
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lakescan",
@@ -308,6 +336,24 @@ def build_parser() -> argparse.ArgumentParser:
     rs = sub.add_parser("resume", help="continue an unfinished reclamation batch")
     rs.add_argument("--table", required=True)
     rs.set_defaults(fn=cmd_resume)
+
+    # -- bitemporal fact attribution --------------------------------------
+    baf = sub.add_parser(
+        "build-attribution-fixtures",
+        help="build the fact/dimension attribution drill tables (runtime)",
+    )
+    baf.add_argument("--out", required=True)
+    baf.set_defaults(fn=cmd_build_attribution_fixtures)
+
+    at = sub.add_parser(
+        "attribute",
+        help="bitemporal fact attribution into a one-shot output directory",
+    )
+    at.add_argument("--config", required=True,
+                    help="JSON mapping config (fact/dimension sides + roles)")
+    at.add_argument("--work-dir")
+    at.add_argument("--batch-size", type=int, default=8192)
+    at.set_defaults(fn=cmd_attribute)
     return p
 
 

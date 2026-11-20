@@ -269,6 +269,116 @@ python3 verify_lifecycle.py
 python3 -m pytest tests/test_lifecycle.py tests/test_lifecycle_processes.py -q
 ```
 
+## 双时间事实归因（attribute）
+
+结算团队每月重建订单所属结算组。本任务接收一个**可见订单（事实）快照**与一个
+**规则修订（维度）快照**，按“结算时已掌握的信息 + 业务发生时间”做双时间归因，
+把逐订单结果一次性交付到一个全新目录（Parquet 数据 + 清单）。
+
+### 映射配置
+
+一份 JSON 配置指定两个本地表目录、各自读取的快照与目标 schema、字段角色，以及
+输出载荷列的 `field_id` 与列名；同目录可传不同快照，两张表也可以位于不同目录。
+
+- 事实角色：`fact_id`（非空唯一 UTF-8）、`fact_entity_key`（非空 UTF-8 实体键）、
+  `fact_business_time` 与 `fact_knowledge_cutoff`（int64，允许 int32 精确扩宽）。
+- 维度角色：`dim_entity_key`、`dim_rule_id`（非空 UTF-8）、`dim_published_at`（int64）、
+  `dim_operation`（`put`/`withdraw`）、`dim_valid_from`（int64）、
+  `dim_valid_to`（可空 int64）、`dim_priority`（非空 int64）。
+- 实体键是两表的关联域，按原值（UTF-8 字节）精确匹配。规则身份是
+  `(实体键, 规则ID)`；同一身份同一发布时间出现两条可见记录即拒绝整个任务，
+  即使两条内容完全相同。
+- `put` 携带完整区间与载荷：`valid_from < 非空 valid_to`，空 `valid_to` 表示无上界；
+  `withdraw` 的区间、优先级与维度载荷必须为空，作用于整条规则。允许先撤回再发布、
+  也允许撤回当时不存在的规则。
+
+### 双时间语义
+
+对每笔事实，先求每条规则在其**知识截止时刻**（发布时间等于截止时刻也可用）的版本：
+即该规则在截止点之前及当时发布的最后一条可见记录。选中 `withdraw` 则规则无效；
+选中 `put` 且其左闭右开区间 `[valid_from, valid_to)` 包含业务时刻时才参与归因。
+空上界须能覆盖最大 int64 业务时刻，边界允许最小/最大整数。最新修订把起点推迟后，
+旧版本让出的时间段不会重新生效。湖表 POS/EQ 删除先决定哪些修订可见；被湖表删除的
+最新修订从可用历史中消失，而可见的业务 `withdraw` 保留自身的时间语义。
+
+在按实体键与时间规则留下的候选中取最高优先级：一条写 `matched`（带规则 ID、版本
+发布时间、维度源行坐标与配置要求的维度载荷）；零条写 `unmatched`；多条写
+`ambiguous`（附最高优先级候选总数，以及按规则 ID 的 UTF-8 字节序排列的前两条证据，
+每条含规则 ID、发布时间与维度源行）。后两种状态的选中维度字段一律为空。每笔事实
+恰好一条输出，始终保留事实源行 `(file_id, row_position)`、实体键、两种时刻与所选
+事实载荷；逻辑行按事实 ID 的 UTF-8 字节序排列。
+
+### 有界内存、原子交付与读保护
+
+- 事实数、修订数、单实体历史长度、同时有效候选数都可能超过内存批量：两侧流式写入
+  同一 SQLite 落盘库（受限页缓存、分块写入），版本推进是基于索引的集合式 UPSERT，
+  每条修订在整个任务中至多被读一次；赢家选择、计数与两条歧义证据都是
+  GROUP BY / LIMIT 聚合，绝不物化“事实 × 全部命中版本”的 Python 配对，也不为每条
+  事实扫描整个实体历史。Python 内存只取决于固定流式批大小。
+- 输出目录一次性交付：先写同文件系统的暂存目录并 fsync，成功后 `os.replace` 原子
+  改名；目标目录已存在则拒绝，失败时不公开部分结果、不动已有目录。零事实也交付带
+  正确类型的空 Parquet。清单记录两侧快照与可见行数、源清单摘要、映射、行数与各状态
+  计数、输出文件摘要及每列的角色与精确类型/可空性。
+- 托管表沿用真实读保护：同一表的两个快照在打开任何数据/删除文件前一起取得保护；
+  两个表则在打开任一侧输入文件前分别取得各自保护。读取失败或完成后释放保护。
+
+### 命令与库接口
+
+```bash
+# 运行时生成事实/维度两张演练表（仓库不带数据产物）
+python3 -m lakescan build-attribution-fixtures --out /tmp/attrdrill
+
+# 一次性归因，交付到配置指定的新目录
+python3 -m lakescan attribute --config mapping.json [--work-dir DIR] [--batch-size N]
+```
+
+```python
+from lakescan import FactAttributor
+
+result = FactAttributor("mapping.json").attribute()
+print(result.stats.to_json())       # matched / unmatched / ambiguous / total
+# result.output_dir / .data_file / .manifest_file
+```
+
+`mapping.json` 示例（字段 id 对应演练夹具）：
+
+```json
+{
+  "fact": {
+    "table": "/tmp/attrdrill/facts", "snapshot": "facts_main", "schema": 100,
+    "roles": {"fact_id": 1, "fact_entity_key": 2,
+              "fact_business_time": 3, "fact_knowledge_cutoff": 4},
+    "fact_payload": [{"field_id": 5, "name": "fact_amount"},
+                     {"field_id": 6, "name": "fact_note"}]
+  },
+  "dimension": {
+    "table": "/tmp/attrdrill/dimensions", "snapshot": "dims_full", "schema": 200,
+    "roles": {"dim_entity_key": 11, "dim_rule_id": 12, "dim_published_at": 13,
+              "dim_operation": 14, "dim_valid_from": 15, "dim_valid_to": 16,
+              "dim_priority": 17},
+    "dim_payload": [{"field_id": 18, "name": "settlement_group"},
+                    {"field_id": 19, "name": "rate_bps"}]
+  },
+  "output_dir": "/tmp/attrdrill/out"
+}
+```
+
+### 独立对照与验收
+
+`verify_attribution.py` **不导入任何 lakescan 代码**：自己重读两份 table.json、
+用 pyarrow 朴素应用 POS/EQ 删除，再以朴素嵌套枚举实现整段双时间归因，最后以子进程
+调用 `attribute` CLI 并逐行、逐值、逐类型核对（含 POS/EQ 隐藏修订与字段改名场景）。
+
+```bash
+python3 verify_attribution.py --base /tmp/attrdrill --dim-snapshot dims_full
+python3 verify_attribution.py --base /tmp/attrdrill --dim-snapshot dims_no_a8_pos
+```
+
+最坏情况开销（F 笔事实、R 条可见修订、H 为最大同时候选数、E 个实体）：时间
+O((F + R) log R)，每笔事实仅常数条索引语句；磁盘 O(F + R)；Python 内存 O(B)
+（固定流式批 B），与 F、R、单实体历史长度及 H 无关；计数与歧义证据抽取在热键下
+同样只走聚合索引，不把候选集拉入 Python。
+
 ## 布局
 
 - `lakescan/schema.py` — 字段身份、精确扩宽规则、键的规范编码
@@ -279,6 +389,12 @@ python3 -m pytest tests/test_lifecycle.py tests/test_lifecycle_processes.py -q
 - `lakescan/fixtures.py` — 单快照演练夹具构建
 - `lakescan/diff.py` — 跨快照键差异：两侧落盘存储、外部归并、原子发布
 - `lakescan/diff_fixtures.py` — diff 演练表的运行时生成（含逐键手工推导）
+- `lakescan/attribution_config.py` — 归因映射配置的解析与角色/输出列校验
+- `lakescan/attribution_store.py` — 两侧可见行的流式抽取、校验与 SQLite 落盘库
+- `lakescan/attribution_engine.py` — 双时间版本选择、区间包含与赢家/歧义聚合
+- `lakescan/attribution_writer.py` — 类型化 Parquet、清单与一次性原子目录交付
+- `lakescan/attribution.py` — 公共 API：读保护编排、抽取、归因、发布的总入口
+- `lakescan/attribution_fixtures.py` — 归因演练表与热键规模表的运行时生成
 - `lakescan/lifecycle/state.py` — 纳管绑定、只读校验、清单漂移/状态损坏失败关闭、文件锁
 - `lakescan/lifecycle/guards.py` — 读保护令牌注册表（真实读生命周期、僵死令牌清扫）
 - `lakescan/lifecycle/policy.py` — 分支/书签保留规则与保留/退役/删除计划推导
@@ -288,9 +404,14 @@ python3 -m pytest tests/test_lifecycle.py tests/test_lifecycle_processes.py -q
 - `verify.py` — 单快照独立对照（与库零共享代码）
 - `verify_compare.py` — 跨快照 diff 独立对照（不导入库，朴素物理行表 + 子进程 CLI）
 - `verify_lifecycle.py` — 生命周期独立对照（不导入库，手写保留/删除推导 + 子进程 CLI）
+- `verify_attribution.py` — 双时间归因独立对照（不导入库，朴素枚举 + 子进程 CLI）
 - `tests/test_acceptance.py` — 单快照验收套件（含运行时生成的大删除表落盘/内存上限验证）
 - `tests/test_diff.py` — 跨快照 diff 验收套件（分支、三类变更、删除作用域、
   schema 演化、null/重复键拒绝、损坏不发布、原子替换、有界内存、顺序/row group 不变性）
 - `tests/test_lifecycle.py` — 保留策略、读保护、失败关闭、受阻/恢复的进程内验收
 - `tests/test_lifecycle_processes.py` — 独立子进程时序/杀进程/跨进程恢复/并发验收
 - `tests/lifecycle_worker.py` — 跨进程验收用的确定性 worker（崩溃边界注入、旗标同步）
+- `tests/test_attribution.py` — 双时间归因验收（双时间语义、湖删隐藏修订、边界、
+  改名、各类非法输入拒绝、原子交付、热键有界内存与无乘积展开）
+- `tests/test_attribution_processes.py` — 归因读保护的跨进程时序、半途失败释放与回收竞争
+- `tests/attribution_worker.py` — 归因跨进程验收用的确定性 worker（持保护停车）
